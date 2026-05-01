@@ -18,6 +18,7 @@ _EMIT_STL_WARNING(STL4038, "The contents of <ranges> are available only with C++
 #include <span>
 #include <string_view>
 #include <tuple>
+#include <variant>
 
 #if _HAS_CXX23
 #include <array>
@@ -2646,6 +2647,17 @@ namespace ranges {
         return static_cast<_Ty&>(_Val);
     }
 
+#if _HAS_CXX23
+    template <bool _IsConst, class... _Views>
+    concept _All_random_access = (random_access_range<_Maybe_const<_IsConst, _Views>> && ...);
+
+    template <bool _IsConst, class... _Views>
+    concept _All_bidirectional = (bidirectional_range<_Maybe_const<_IsConst, _Views>> && ...);
+
+    template <bool _IsConst, class... _Views>
+    concept _All_forward = (forward_range<_Maybe_const<_IsConst, _Views>> && ...);
+#endif // _HAS_CXX23
+
     struct _Construct_tag {
         explicit _Construct_tag() = default;
     };
@@ -3095,6 +3107,18 @@ namespace ranges {
         typename _Concat_value_t<_Rngs...>;
         typename _Concat_rvalue_reference_t<_Rngs...>;
     } && _Concat_indirectly_readable<_Rngs...>;
+
+    template <bool _IsConst, class... _Rngs>
+    concept _Concat_is_random_access = []<size_t... _Indices>(index_sequence<_Indices...>) {
+        return _All_random_access<_IsConst, _Rngs...>
+            && (common_range<_Maybe_const<_IsConst, _Rngs...[_Indices]>> && ...);
+    }(make_index_sequence<sizeof...(_Rngs) - 1>{});
+
+    template <bool _IsConst, class... _Rngs>
+    concept _Concat_is_bidirectional = []<size_t... _Indices>(index_sequence<_Indices...>) {
+        return _All_bidirectional<_IsConst, _Rngs...>
+            && (common_range<_Maybe_const<_IsConst, _Rngs...[_Indices]>> && ...);
+    }(make_index_sequence<sizeof...(_Rngs) - 1>{});
 
     _EXPORT_STD template <input_range _Vw, forward_range _Pat>
         requires view<_Vw> && input_range<range_reference_t<_Vw>> && view<_Pat>
@@ -4224,6 +4248,474 @@ namespace ranges {
         };
 
         _EXPORT_STD inline constexpr _Split_fn split;
+    } // namespace views
+
+    _EXPORT_STD template <input_range... _ViewTypes>
+        requires (view<_ViewTypes> && ...) && (sizeof...(_ViewTypes) > 0) && _Concatable<_ViewTypes...>
+    class concat_view : public view_interface<concat_view<_ViewTypes...>> {
+    private:
+        /* [[no_unique_address]] */ tuple<_ViewTypes...> _Views;
+
+        template <bool _IsConst>
+        struct _Category_base {};
+
+        template <bool _IsConst>
+            requires _All_forward<_IsConst, _ViewTypes...>
+        struct _Category_base<_IsConst> {
+        private:
+            template <class _Tag_type>
+            static constexpr bool _Iterators_derive_from_tag =
+                (derived_from<
+                     typename iterator_traits<iterator_t<_Maybe_const<_IsConst, _ViewTypes>>>::iterator_category,
+                     _Tag_type>
+                    && ...);
+
+        public:
+            using iterator_category =
+                conditional_t<!is_reference_v<_Concat_reference_t<_Maybe_const<_IsConst, _ViewTypes>...>>,
+                    input_iterator_tag,
+                    conditional_t<_Iterators_derive_from_tag<random_access_iterator_tag>
+                                      && _Concat_is_random_access<_IsConst, _ViewTypes...>,
+                        random_access_iterator_tag,
+                        conditional_t<_Iterators_derive_from_tag<bidirectional_iterator_tag>
+                                          && _Concat_is_bidirectional<_IsConst, _ViewTypes...>,
+                            bidirectional_iterator_tag,
+                            conditional_t<_Iterators_derive_from_tag<forward_iterator_tag>, forward_iterator_tag,
+                                input_iterator_tag>>>>;
+        };
+
+        template <bool _IsConst>
+        class _Iterator : public _Category_base<_IsConst> {
+        public:
+            using iterator_concept = conditional_t<_Concat_is_random_access<_IsConst, _ViewTypes...>,
+                random_access_iterator_tag,
+                conditional_t<_Concat_is_bidirectional<_IsConst, _ViewTypes...>, bidirectional_iterator_tag,
+                    conditional_t<_All_forward<_IsConst, _ViewTypes...>, forward_iterator_tag, input_iterator_tag>>>;
+            using value_type       = _Concat_value_t<_Maybe_const<_IsConst, _ViewTypes>...>;
+            using difference_type  = common_type_t<range_difference_t<_Maybe_const<_IsConst, _ViewTypes>>...>;
+
+        private:
+            friend concat_view;
+
+            using _Base_iter = variant<iterator_t<_Maybe_const<_IsConst, _ViewTypes>>...>;
+
+            _Maybe_const<_IsConst, concat_view>* _Parent = nullptr;
+            _Base_iter _It;
+
+            template <size_t _Index>
+            constexpr void _Satisfy() {
+                if constexpr (_Index < (sizeof...(_ViewTypes) - 1)) {
+                    if (_STD get<_Index>(_It) == _RANGES end(_STD get<_Index>(_Parent->_Views))) {
+                        _It.template emplace<_Index + 1>(_RANGES begin(_STD get<_Index + 1>(_Parent->_Views)));
+                        _Satisfy<_Index + 1>();
+                    }
+                }
+            }
+
+            template <size_t _Index>
+            constexpr void _Prev() {
+                if constexpr (_Index == 0) {
+                    --_STD get<_Index>(_It);
+                } else {
+                    if (_STD get<_Index>(_It) == _RANGES begin(_STD get<_Index>(_Parent->_Views))) {
+                        _It.template emplace<_Index - 1>(_RANGES end(_STD get<_Index - 1>(_Parent->_Views)));
+                        _Prev<_Index - 1>();
+                    } else {
+                        --_STD get<_Index>(_It);
+                    }
+                }
+            }
+
+            template <size_t _Index>
+            constexpr void _Advance_fwd(difference_type _Offset, difference_type _Steps) {
+                using _Underlying_diff_type = iter_difference_t<variant_alternative_t<_Index, _Base_iter>>;
+                if constexpr (_Index == sizeof...(_ViewTypes) - 1) {
+                    _STD get<_Index>(_It) += static_cast<_Underlying_diff_type>(_Steps);
+                } else {
+                    auto _Index_size = _RANGES distance(_STD get<_Index>(_Parent->_Views));
+                    if (_Offset + _Steps < _Index_size) {
+                        _STD get<_Index>(_It) += static_cast<_Underlying_diff_type>(_Steps);
+                    } else {
+                        _It.template emplace<_Index + 1>(_RANGES begin(_STD get<_Index + 1>(_Parent->_Views)));
+                        _Advance_fwd<_Index + 1>(0, _Offset + _Steps - _Index_size);
+                    }
+                }
+            }
+
+            template <size_t _Index>
+            constexpr void _Advance_bwd(difference_type _Offset, difference_type _Steps) {
+                using _Underlying_diff_type = iter_difference_t<variant_alternative_t<_Index, _Base_iter>>;
+                if constexpr (_Index == 0) {
+                    _STD get<_Index>(_It) -= static_cast<_Underlying_diff_type>(_Steps);
+                } else {
+                    if (_Offset >= _Steps) {
+                        _STD get<_Index>(_It) -= static_cast<_Underlying_diff_type>(_Steps);
+                    } else {
+                        auto _Prev_size = _RANGES distance(_STD get<_Index - 1>(_Parent->_Views));
+                        _It.template emplace<_Index - 1>(_RANGES end(_STD get<_Index - 1>(_Parent->_Views)));
+                        _Advance_bwd<_Index - 1>(_Prev_size, _Steps - _Offset);
+                    }
+                }
+            }
+
+            template <class... _Types>
+            constexpr explicit _Iterator(_Maybe_const<_IsConst, concat_view>* _Parent, _Types&&... _Args)
+                requires constructible_from<_Base_iter, _Types&&...>
+                : _Parent(_Parent), _It(_STD forward<_Types>(_Args)...) {}
+
+        public:
+            _Iterator() = default;
+
+            constexpr _Iterator(_Iterator<!_IsConst> _Rhs)
+                requires (_IsConst && (convertible_to<iterator_t<_ViewTypes>, iterator_t<const _ViewTypes>> && ...))
+                : _Parent(_Rhs._Parent),
+                  _It(_STD _Variant_raw_visit(_Rhs._It.index(), _Rhs._It._Storage(), [&](auto _Ref) -> _Base_iter {
+                      constexpr size_t _Idx = decltype(_Ref)::_Idx;
+                      if constexpr (_Idx != variant_npos) {
+                          return _Base_iter(in_place_index<_Idx>, _STD get<_Idx>(_STD move(_Rhs._It)));
+                      }
+                  })) {}
+
+            _NODISCARD constexpr decltype(auto) operator*() const {
+                using _Ref = _Concat_reference_t<_Maybe_const<_IsConst, _ViewTypes>...>;
+                return _STD visit([](auto&& _It) -> _Ref { return *_It; }, _It);
+            }
+
+            constexpr _Iterator& operator++() {
+                return _STD _Variant_raw_visit(_It.index(), _It._Storage(), [&](auto _Ref) -> _Iterator& {
+                    constexpr size_t _Idx = decltype(_Ref)::_Idx;
+                    if constexpr (_Idx != variant_npos) {
+                        ++_STD get<_Idx>(_It);
+                        _Satisfy<_Idx>();
+                        return *this;
+                    }
+                });
+            }
+
+            constexpr void operator++(int) {
+                ++*this;
+            }
+
+            constexpr _Iterator operator++(int)
+                requires _All_forward<_IsConst, _ViewTypes...>
+            {
+                auto _Temp = *this;
+                ++*this;
+
+                return _Temp;
+            }
+
+            constexpr _Iterator& operator--()
+                requires _Concat_is_bidirectional<_IsConst, _ViewTypes...>
+            {
+                return _STD _Variant_raw_visit(_It.index(), _It._Storage(), [&](auto _Ref) -> _Iterator& {
+                    constexpr size_t _Idx = decltype(_Ref)::_Idx;
+                    if constexpr (_Idx != variant_npos) {
+                        _Prev<_Idx>();
+                        return *this;
+                    }
+                });
+            }
+
+            constexpr _Iterator operator--(int)
+                requires _Concat_is_bidirectional<_IsConst, _ViewTypes...>
+            {
+                auto _Temp = *this;
+                --*this;
+
+                return _Temp;
+            }
+
+            constexpr _Iterator& operator+=(const difference_type _Off)
+                requires _Concat_is_random_access<_IsConst, _ViewTypes...>
+            {
+                return _STD _Variant_raw_visit(_It.index(), _It._Storage(), [&](auto _Ref) -> _Iterator& {
+                    constexpr size_t _Idx = decltype(_Ref)::_Idx;
+                    if constexpr (_Idx != variant_npos) {
+                        if (_Off > 0) {
+                            _Advance_fwd<_Idx>(
+                                _STD get<_Idx>(_It) - _RANGES begin(_STD get<_Idx>(_Parent->_Views)), _Off);
+                        } else if (_Off < 0) {
+                            _Advance_bwd<_Idx>(
+                                _STD get<_Idx>(_It) - _RANGES begin(_STD get<_Idx>(_Parent->_Views)), -_Off);
+                        }
+                        return *this;
+                    }
+                });
+            }
+
+            constexpr _Iterator& operator-=(const difference_type _Off)
+                requires _Concat_is_random_access<_IsConst, _ViewTypes...>
+            {
+                *this += -_Off;
+                return *this;
+            }
+
+            _NODISCARD constexpr decltype(auto) operator[](const difference_type _Where) const
+                requires _Concat_is_random_access<_IsConst, _ViewTypes...>
+            {
+                return *(*this + _Where);
+            }
+
+            _NODISCARD friend constexpr bool operator==(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                requires (equality_comparable<iterator_t<_Maybe_const<_IsConst, _ViewTypes>>> && ...)
+            {
+                return _Lhs._It == _Rhs._It;
+            }
+
+            _NODISCARD friend constexpr bool operator==(const _Iterator& _Itr, default_sentinel_t) {
+                constexpr auto _Last_idx = sizeof...(_ViewTypes) - 1;
+                return _Itr._It.index() == _Last_idx
+                    && _STD get<_Last_idx>(_Itr._It) == _RANGES end(_STD get<_Last_idx>(_Itr._Parent->_Views));
+            }
+
+            _NODISCARD friend constexpr bool operator<(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                requires _All_random_access<_IsConst, _ViewTypes...>
+            {
+                return _Lhs._It < _Rhs._It;
+            }
+
+            _NODISCARD friend constexpr bool operator>(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                requires _All_random_access<_IsConst, _ViewTypes...>
+            {
+                return _Lhs._It > _Rhs._It;
+            }
+
+            _NODISCARD friend constexpr bool operator<=(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                requires _All_random_access<_IsConst, _ViewTypes...>
+            {
+                return _Lhs._It <= _Rhs._It;
+            }
+
+            _NODISCARD friend constexpr bool operator>=(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                requires _All_random_access<_IsConst, _ViewTypes...>
+            {
+                return _Lhs._It >= _Rhs._It;
+            }
+
+            _NODISCARD friend constexpr auto operator<=>(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                requires (_All_random_access<_IsConst, _ViewTypes...>
+                          && (three_way_comparable<iterator_t<_Maybe_const<_IsConst, _ViewTypes>>> && ...))
+            {
+                return _Lhs._It <=> _Rhs._It;
+            }
+
+            _NODISCARD friend constexpr _Iterator operator+(const _Iterator& _Lhs, const difference_type _Rhs)
+                requires _Concat_is_random_access<_IsConst, _ViewTypes...>
+            {
+                auto _Modified_iterator = _Lhs;
+                _Modified_iterator += _Rhs;
+
+                return _Modified_iterator;
+            }
+
+            _NODISCARD friend constexpr _Iterator operator+(const difference_type _Lhs, const _Iterator& _Rhs)
+                requires _Concat_is_random_access<_IsConst, _ViewTypes...>
+            {
+                return _Rhs + _Lhs;
+            }
+
+            _NODISCARD friend constexpr _Iterator operator-(const _Iterator& _Lhs, const difference_type _Rhs)
+                requires _Concat_is_random_access<_IsConst, _ViewTypes...>
+            {
+                auto _Modified_iterator = _Lhs;
+                _Modified_iterator -= _Rhs;
+
+                return _Modified_iterator;
+            }
+
+            _NODISCARD friend constexpr difference_type operator-(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                requires _Concat_is_random_access<_IsConst, _ViewTypes...>
+            {
+                return _STD _Variant_raw_visit(
+                    _Lhs._It.index(), _Lhs._It._Storage(), [&](auto _Lhs_ref) -> difference_type {
+                        constexpr size_t _Lhs_idx = decltype(_Lhs_ref)::_Idx;
+                        if constexpr (_Lhs_idx != variant_npos) {
+                            return _STD _Variant_raw_visit(_Rhs._It.index(), _Rhs._It._Storage(), [&](auto _Rhs_ref) {
+                                constexpr size_t _Rhs_idx = decltype(_Rhs_ref)::_Idx;
+                                if constexpr (_Lhs_idx > _Rhs_idx) {
+                                    constexpr auto _Offset = _Rhs_idx + 1;
+                                    return _RANGES distance(_STD get<_Rhs_idx>(_Rhs._It),
+                                               _RANGES end(_STD get<_Rhs_idx>(_Rhs._Parent->_Views)))
+                                         +
+                                           [&]<size_t... _Indices>(index_sequence<_Indices...>) {
+                                               return (static_cast<difference_type>(_RANGES size(
+                                                           _STD get<_Indices + _Offset>(_Lhs._Parent->_Views)))
+                                                       + ... + 0);
+                                           }(make_index_sequence<_Lhs_idx - _Offset>{})
+                                         + _RANGES distance(_RANGES begin(_STD get<_Lhs_idx>(_Lhs._Parent -> _Views)),
+                                             _STD get<_Lhs_idx>(_Lhs._It));
+                                } else if constexpr (_Lhs_idx < _Rhs_idx) {
+                                    return -(_Rhs - _Lhs);
+                                } else {
+                                    return _STD get<_Lhs_idx>(_Lhs._It) - _STD get<_Rhs_idx>(_Rhs._It);
+                                }
+                            });
+                        }
+                    });
+            }
+
+            _NODISCARD friend constexpr difference_type operator-(const _Iterator& _Itr, default_sentinel_t)
+                requires ([]<size_t _FirstIdx /* = 0 */, size_t... _Idxs>(index_sequence<_FirstIdx, _Idxs...>) {
+                    return (sized_sentinel_for<sentinel_t<_Maybe_const<_IsConst, _ViewTypes>>,
+                                iterator_t<_Maybe_const<_IsConst, _ViewTypes>>>
+                               && ...)
+                        && (sized_range<_Maybe_const<_IsConst, _ViewTypes...[_Idxs]>> && ...);
+                }(index_sequence_for<_ViewTypes...>{}))
+            {
+                return _STD _Variant_raw_visit(
+                    _Itr._It.index(), _Itr._It._Storage(), [&](auto _Ref) -> difference_type {
+                        constexpr size_t _Idx = decltype(_Ref)::_Idx;
+                        if constexpr (_Idx != variant_npos) {
+                            constexpr auto _Offset = _Idx + 1;
+                            return -(_RANGES distance(
+                                         _STD get<_Idx>(_Itr._It), _RANGES end(_STD get<_Idx>(_Itr._Parent->_Views)))
+                                     + [&]<size_t... _Indices>(index_sequence<_Indices...>) {
+                                           return (static_cast<difference_type>(
+                                                       _RANGES size(_STD get<_Indices + _Offset>(_Itr._Parent->_Views)))
+                                                   + ... + 0);
+                                       }(make_index_sequence<sizeof...(_ViewTypes) - _Offset>{}));
+                        }
+                    });
+            }
+
+            _NODISCARD friend constexpr difference_type operator-(default_sentinel_t, const _Iterator& _Itr)
+                requires ([]<size_t _FirstIdx /* = 0 */, size_t... _Idxs>(index_sequence<_FirstIdx, _Idxs...>) {
+                    return (sized_sentinel_for<sentinel_t<_Maybe_const<_IsConst, _ViewTypes>>,
+                                iterator_t<_Maybe_const<_IsConst, _ViewTypes>>>
+                               && ...)
+                        && (sized_range<_Maybe_const<_IsConst, _ViewTypes...[_Idxs]>> && ...);
+                }(index_sequence_for<_ViewTypes...>{}))
+            {
+                return -(_Itr - default_sentinel);
+            }
+
+            _NODISCARD friend constexpr decltype(auto) iter_move(const _Iterator& _Itr)
+                noexcept(((is_nothrow_invocable_v<decltype(_RANGES iter_move),
+                               const iterator_t<_Maybe_const<_IsConst, _ViewTypes>>&>
+                              && is_nothrow_convertible_v<range_rvalue_reference_t<_Maybe_const<_IsConst, _ViewTypes>>,
+                                  _Concat_rvalue_reference_t<_Maybe_const<_IsConst, _ViewTypes>...>>)
+                          && ...)) {
+                return _STD visit(
+                    [](const auto& _It) -> _Concat_rvalue_reference_t<_Maybe_const<_IsConst, _ViewTypes>...> {
+                        return _RANGES iter_move(_It);
+                    },
+                    _Itr._It);
+            }
+
+            _NODISCARD friend constexpr void iter_swap(const _Iterator& _Lhs, const _Iterator& _Rhs)
+                noexcept(noexcept([](auto... _Its) {
+                    return (noexcept(_RANGES swap(*_Lhs, *_Rhs)) && ... && noexcept(_RANGES iter_swap(_Its, _Its)));
+                }(declval<const iterator_t<_Maybe_const<_IsConst, _ViewTypes>>>()...)))
+                requires swappable_with<iter_reference_t<_Iterator>, iter_reference_t<_Iterator>>
+                      && (... && indirectly_swappable<iterator_t<_Maybe_const<_IsConst, _ViewTypes>>>)
+            {
+                _STD visit(
+                    [&](const auto& _It1, const auto& _It2) {
+                        if constexpr (is_same_v<decltype(_It1), decltype(_It2)>) {
+                            _RANGES iter_swap(_It1, _It2);
+                        } else {
+                            _RANGES swap(*_Lhs, *_Rhs);
+                        }
+                    },
+                    _Lhs._It, _Rhs._It);
+            }
+        };
+
+        static constexpr auto _Size_closure = [](auto... _Sizes) static noexcept {
+            using _Common_unsigned_type = _Make_unsigned_like_t<common_type_t<decltype(_Sizes)...>>;
+            return (static_cast<_Common_unsigned_type>(_Sizes) + ...);
+        };
+
+    public:
+        constexpr concat_view() noexcept((is_nothrow_default_constructible_v<_ViewTypes> && ...)) = default;
+
+        constexpr explicit concat_view(_ViewTypes... _Args) : _Views{_STD move(_Args)...} {}
+
+        _NODISCARD constexpr _Iterator<false> begin()
+            requires (!(_Simple_view<_ViewTypes> && ...))
+        {
+            _Iterator<false> _It(this, in_place_index<0>, _RANGES begin(_STD get<0>(_Views)));
+            _It.template _Satisfy<0>();
+            return _It;
+        }
+
+        _NODISCARD constexpr _Iterator<true> begin() const
+            requires (range<const _ViewTypes> && ...) && _Concatable<const _ViewTypes...>
+        {
+            _Iterator<true> _It(this, in_place_index<0>, _RANGES begin(_STD get<0>(_Views)));
+            _It.template _Satisfy<0>();
+            return _It;
+        }
+
+        _NODISCARD constexpr auto end()
+            requires (!(_Simple_view<_ViewTypes> && ...))
+        {
+            constexpr auto _Nx = sizeof...(_ViewTypes);
+            if constexpr (_All_forward<false, _ViewTypes...>
+                          && common_range<_Maybe_const<false, _ViewTypes...[_Nx - 1]>>) {
+                return _Iterator<false>(this, in_place_index<_Nx - 1>, _RANGES end(_STD get<_Nx - 1>(_Views)));
+            } else {
+                return default_sentinel;
+            }
+        }
+
+        _NODISCARD constexpr auto end() const
+            requires (range<const _ViewTypes> && ...) && _Concatable<const _ViewTypes...>
+        {
+            constexpr auto _Nx = sizeof...(_ViewTypes);
+            if constexpr (_All_forward<true, _ViewTypes...>
+                          && common_range<_Maybe_const<true, _ViewTypes...[_Nx - 1]>>) {
+                return _Iterator<true>(this, in_place_index<_Nx - 1>, _RANGES end(_STD get<_Nx - 1>(_Views)));
+            } else {
+                return default_sentinel;
+            }
+        }
+
+        _NODISCARD constexpr auto size()
+            requires (sized_range<_ViewTypes> && ...)
+        {
+            return _STD apply(_Size_closure, _Tuple_transform(_RANGES size, _Views));
+        }
+
+        _NODISCARD constexpr auto size() const
+            requires (sized_range<const _ViewTypes> && ...)
+        {
+            return _STD apply(_Size_closure, _Tuple_transform(_RANGES size, _Views));
+        }
+    };
+
+    template <class... _RangeTypes>
+    concat_view(_RangeTypes&&...) -> concat_view<views::all_t<_RangeTypes>...>;
+
+    namespace views {
+        class _Concat_fn {
+        private:
+            template <class... _Types>
+            _NODISCARD static consteval bool _Is_invocation_noexcept() {
+                if constexpr (sizeof...(_Types) == 1 && (input_range<_Types> && ...)) {
+                    return noexcept(views::all(_STD declval<_Types>()...));
+                } else {
+                    return noexcept(concat_view(_STD declval<_Types>()...));
+                }
+            }
+
+        public:
+            template <class... _Types>
+            _NODISCARD static constexpr auto operator()(_Types&&... _Args)
+                noexcept(_Is_invocation_noexcept<_Types...>())
+                requires (sizeof...(_Types) == 1 && (input_range<_Types> && ...))
+                      || requires { concat_view(_STD forward<_Types>(_Args)...); }
+            {
+                if constexpr (sizeof...(_Types) == 1 && (input_range<_Types> && ...)) {
+                    return views::all(_STD forward<_Types>(_Args)...);
+                } else {
+                    return concat_view(_STD forward<_Types>(_Args)...);
+                }
+            }
+        };
+
+        _EXPORT_STD inline constexpr _Concat_fn concat{};
 
         class _Counted_fn {
         private:
@@ -7101,15 +7593,6 @@ namespace ranges {
         noexcept(_STD apply(_Tuple_for_each_closure(_Callback), _STD forward<_TupleType>(_Tuple)))) /* strengthened */ {
         _STD apply(_Tuple_for_each_closure(_Callback), _STD forward<_TupleType>(_Tuple));
     }
-
-    template <bool _IsConst, class... _Views>
-    concept _All_random_access = (random_access_range<_Maybe_const<_IsConst, _Views>> && ...);
-
-    template <bool _IsConst, class... _Views>
-    concept _All_bidirectional = (bidirectional_range<_Maybe_const<_IsConst, _Views>> && ...);
-
-    template <bool _IsConst, class... _Views>
-    concept _All_forward = (forward_range<_Maybe_const<_IsConst, _Views>> && ...);
 
     template <class _ResultType, class... _LHSTupleTypes, class... _RHSTupleTypes>
         requires (sizeof...(_LHSTupleTypes) == sizeof...(_RHSTupleTypes))
